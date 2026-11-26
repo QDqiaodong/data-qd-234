@@ -161,6 +161,47 @@ def handle(payload):
    时才允许提前返回 `Busy`。不相关操作的承诺量不能单独成为拒绝理由。拒绝不占名额、
    不留承诺、不产生样本。
 
+## 延时增量外发与无重计换接
+
+`delta_export.py` 的 `DeltaExporter` 与 `Histograms` 共用同一个真实 registry，但不清空累计值。构造时的 `snapshot()` 是外发起点；之后每次 `step()` 在没有待确认批时取一次新快照，把相对上次已确认边界的增量组成一批。`delta["le_counts"]` 是各累计 `le_counts` 计数器的差值，因此在本批内仍是累计桶数；等号样本和超过末桶的样本继续沿用 `Histograms` 口径。所有操作行（包括零增量行）都会保留。
+
+进程内可直接使用 `InProcessMeter` 作为接收端；生产集成时把 `send`/`fence` 换成真实 RPC 回调即可：
+
+```python
+from delta_export import DeltaExporter, InProcessMeter
+from metrics import Histograms
+
+registry = Histograms(["checkout"], [100, 250])
+meter = InProcessMeter(("old", "new"))
+exporter = DeltaExporter(
+    registry,
+    stream_id="checkout-host-a",   # 每个 exporter 实例唯一
+    sinks=("old", "new"),
+    initial_sink="old",
+    send=meter.send,
+    fence=meter.fence,
+)
+
+registry.observe("checkout", 42)
+exporter.step()                    # "advanced"：seq=1 已在 old 入账
+
+# 运维提交换接；该调用本身不发 RPC。
+exporter.switch_to("new")
+
+registry.observe("checkout", 300)
+exporter.step()                    # "advanced"：seq=2 直接进入 new
+print(meter.totals("old"))         # {'checkout': {'count': 1, 'sum_us': 42}}
+print(meter.totals("new"))         # {'checkout': {'count': 1, 'sum_us': 300}}
+```
+
+应由一个控制线程按固定节奏调用 `step()`。它每次最多调用一个外部回调，不睡眠、不内部循环：
+
+- `"idle"`：没有待确认批，也没有新增完成量，本次不调用外端；
+- `"pending"`：批仍未得到“已计入”的确定答复（包括 `TimeoutError`），下次继续推进同一 `seq`；
+- `"advanced"`：本次确定了一个已入账批，registry 边界才前进到该批快照。
+
+换接采用封边路径：若旧端结果不明，下一次推进对旧 `(stream_id, seq)` 调 `fence`。得到 `"applied"` 表示旧端已入账，该批留在旧端；得到 `"sealed"` 表示旧端保证永远不能再计入，随后才把**同一 `seq`、同一不可变 delta** 发给新端。`fence` 超时同样不提供证据，只会原样重试幂等 `fence`，不会猜测性地发新端。序号只属于非空批，换端和重送都不重置或另开序号。发送回调里可以运行业务代码并记录新样本；delta 在回调前已固定，这些新完成量只会进入下一批。`test_delta_export.py` 用真实 `Admission`/`Histograms`、可控时钟和可注入丢回复的进程内计量器覆盖了这一验收场景。
+
 ## 离线运行
 
 Python 3.9+，仅标准库。两个演示都使用本仓自制数据和真实回环 HTTP：
@@ -185,7 +226,11 @@ healthy window: 0/2; parse limit=2; parse HTTP 200; scrape parse count=6
 ```
 
 `test_slo.py` 提供 SLO 区间、批量复核、通知和整轮校验的确定性测试；
-`test_metrics.py` 仍包含 GET /metrics 的真实本机 HTTP 回环测试。
+`test_delta_export.py` 覆盖增量桶、丢回复、封边换接、连续序号和真实
+`Admission` 两阶段完成时点；`test_metrics.py` 仍包含 GET /metrics 的真实本机
+HTTP 回环测试。
 
 实现限于单进程、固定策略、同一个持续累积的 registry；没有自动定时器、队列、
-跨进程协调、重启恢复或 Prometheus 格式。调用方负责控制 `/metrics` 的访问范围。
+跨进程协调、重启恢复或 Prometheus 格式。增量导出同样只保存一个待确认批，
+不保存历史批，也不提供进程重启后的序号/去重恢复。调用方负责控制 `/metrics`
+的访问范围。
