@@ -6,6 +6,65 @@
 `le_counts[i]` 包含恰好等于 `bounds_us[i]` 的样本；`count` 包含超过最大桶界的
 样本，`sum_us` 是累计微秒。未知操作拒绝，不隐式扩张标签。
 
+## SLO 窗口裁决与限额复核
+
+`slo.py` 的 `evaluate_window(...)` 接收 1–32 个进程的 `(before, after)` 累计快照，
+只做无状态的单窗口裁决。它使用桶增量、完成数和微秒和求每个进程“严格大于
+`cutoff_us`”的可达最小/最大条数，不猜桶内分布，也不逐样本展开。百分比始终用
+整数乘法比较；例如 4 条中 1 条超时正好是 25%，不算严格超标。
+
+```python
+from metrics import Histograms
+from slo import evaluate_window
+
+
+def snapshot_pair():
+    h = Histograms(["checkout"], [10, 20])
+    h.observe("checkout", 999)       # 旧累计样本，不属于本窗口
+    before = h.snapshot()
+    h.observe("checkout", 13)
+    h.observe("checkout", 15)        # 两条都在 (10, 20]，窗口和为 28
+    return before, h.snapshot()
+
+
+slices = {"worker-a": snapshot_pair(), "worker-b": snapshot_pair()}
+events = []
+
+
+def notify(window_id, operation, action):
+    events.append((window_id, operation, action))
+
+
+def review(window_id, operation, cutoff_us, worker_ids):
+    # worker_ids 是长度 1 或 2 的元组；这里向精细数据源批量查询。
+    exact = {"worker-a": 0, "worker-b": 1}
+    return {worker_id: exact[worker_id] for worker_id in worker_ids}
+
+
+result = evaluate_window(
+    "window-2026-11-26T10:00Z", "checkout", 15, 25, slices,
+    review_budget=2,
+    review=review,
+    incident_open=True,   # 集成方自己保存当前告警状态
+    notify=notify,
+)
+print(result)
+# {'samples': 4, 'slow_min': 1, 'slow_max': 1,
+#  'verdict': 'healthy', 'review_used': 2}
+print(events)
+# [('window-2026-11-26T10:00Z', 'checkout', 'resolve')]
+```
+
+本实现会按“复核前区间宽度降序、进程 ID 升序”排队，并在余额和候选都足够时一次
+批送两台；余额为 1 或只剩一个候选时送一台。`review_used` 是实际发出的进程条数，
+不是回调往返次数。回调可只返回本批部分进程的合法整数；缺项、越界值、布尔值、
+非映射返回或 `OSError` 都不会把复核失败当成健康，相关进程本轮也不会重发。
+
+输入 ID/长度、整数上界、桶界、快照可行性、累计倒退和窗口差量可行性都会在任何
+`review`/`notify` 回调前核完；整轮不合法时抛 `ValueError`。零完成数固定为
+`unknown`，不复核也不通知。`evaluate_window` 不写盘、不保存告警状态；是否已有
+告警由集成方通过 `incident_open` 传入。
+
 ## 让延时观测影响实际准入
 
 ```python
@@ -124,6 +183,9 @@ slow window: 2/3; parse limit=1; parse HTTP 429; lookup HTTP 200
 empty window: limit=1; fresh decision=False
 healthy window: 0/2; parse limit=2; parse HTTP 200; scrape parse count=6
 ```
+
+`test_slo.py` 提供 SLO 区间、批量复核、通知和整轮校验的确定性测试；
+`test_metrics.py` 仍包含 GET /metrics 的真实本机 HTTP 回环测试。
 
 实现限于单进程、固定策略、同一个持续累积的 registry；没有自动定时器、队列、
 跨进程协调、重启恢复或 Prometheus 格式。调用方负责控制 `/metrics` 的访问范围。
