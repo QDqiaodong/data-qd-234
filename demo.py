@@ -15,8 +15,8 @@ class Quiet(WSGIRequestHandler):
 
 
 @contextmanager
-def local_scrape(registry):
-    with make_server("127.0.0.1", 0, scrape_app(registry), handler_class=Quiet) as server:
+def local_http(app):
+    with make_server("127.0.0.1", 0, app, handler_class=Quiet) as server:
         thread = Thread(target=server.serve_forever, kwargs={"poll_interval": .02})
         thread.start()
         try:
@@ -24,6 +24,10 @@ def local_scrape(registry):
         finally:
             server.shutdown()
             thread.join()
+
+
+def local_scrape(registry):
+    return local_http(scrape_app(registry))
 
 
 if __name__ == "__main__":
