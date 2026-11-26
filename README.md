@@ -37,6 +37,71 @@ def handle(payload):
   值。实际应用通常用 `work` 作为这些操作唯一的观测入口；不要对同一请求再次调用
   `observe`。测量范围是 `with` 内的工作，不是排队时间或未在此作用域内完成的流式传输。
 
+## 两段式请求：先声明续段，再开始首段
+
+有些请求的首段会占着资源直到第二段提交完成（例如解码工作区要等下游提交结束才
+释放），而且不同请求可能使用方向相反的操作组合。用 `Admission(..., staged=True)`
+打开两段式准入，然后在进入首段前就把续段操作声明出来：
+
+```python
+from admission import Admission, Busy, Policy
+from metrics import Histograms
+
+registry = Histograms(["decode", "commit"], [50, 100])
+gate = Admission(registry, {
+    "decode": Policy(normal_limit=4, protected_limit=1, budget_us=50,
+                     min_samples=8, max_slow_percent=25),
+    "commit": Policy(normal_limit=4, protected_limit=1, budget_us=50,
+                     min_samples=8, max_slow_percent=25),
+}, staged=True)
+
+def handle(payload):
+    try:
+        # 立即尝试首段；续段 commit 在进入前就已声明（一个“承诺”，不实占名额）。
+        with gate.flow("decode", "commit") as ticket:
+            document = decode_document(payload)   # 持有一个 decode 名额
+            try:
+                with ticket.work():                # 至多成功进入一次续段
+                    commit_downstream(document)    # 内层只持有 commit 名额
+            except Busy:
+                return busy_retry_later()          # Busy 不消耗续段机会，可重试
+            return ok_response()
+    except Busy:
+        return busy_response()                      # 首段被拒：不运行、不留承诺、不记样本
+```
+
+- 启用约束：`staged=True` 时要求 1–32 个已配置操作，且每个 `normal_limit` 不大于
+  32。不启用时旧配置和旧行为完全不变，调用 `flow` 会抛 `RuntimeError`。两个阶段
+  必须是不同的、都在策略内的操作，否则分别抛 `ValueError`、`KeyError`。
+- `with gate.flow(first, next_op) as ticket` 立即占一个 `first` 名额，直到外层退出；
+  同时对 `next_op` 记一个“承诺”。承诺不实占名额，但会进入保护档位的额度判断。
+  `ticket.work()` 尝试占用 `next_op` 名额，成功后名额只在内层持有；退出内层不会
+  提前释放首段。所有入口都不排队，暂时进不去就抛原有 `Busy`，对应 `with` 正文不执行。
+- 每张票只能成功进入一次续段（续段正文抛错也算用过）；`Busy` 不消耗这次机会，外层
+  仍打开时可以重试。对已用过或已结束的票再调 `ticket.work()` 抛 `RuntimeError`。
+  票与创建它的线程绑定；同线程可以同时持有多个互不要求按序退出的请求作用域。跳过
+  续段或首段抛错时，未使用的承诺被取消，名额照常归还。
+- 记账沿用 `clock_ns`、微秒桶和累计 `/metrics` 格式：首段样本量的是 `first` 名额的
+  整个持有时间（包含在内层执行续段的时间），续段只量自己的持有时间；只有成功进入
+  的作用域离开时才记样本，异常离开也记，工作异常不会被吞掉，未进入的续段不记样本。
+
+### 共享准入的三条规则
+
+1. **延时保护。** 每个操作的 `normal_limit` 同时是不可突破的实占上限（普通 `work`、
+   首段、已进入续段正在持有的名额）。某操作处于保护额度时，任何会增加它“承诺量”
+   （实占加未进入续段数）的新 `work`/`flow`，只能在增加后不超过 `protected_limit`
+   时进入；`flow` 对首段和续段目标各加一个承诺，两端都检查。降额不撤销已进入的
+   工作或承诺：已接收的票兑现续段时只看目标实占硬上限，有空位就进，否则 `Busy`，
+   不再重新接受降额审查。
+2. **保留完成路径。** 新 `flow` 不能让已接收的一组请求陷入无法逐张完成的死锁；
+   普通 `work` 或新 `flow` 也不能抢断眼下最后一个可立即兑现的续段机会（必须保证
+   进入后至少还有一张此前可兑现的旧票仍能立即兑现，不能用新票或另一个恰好能结束
+   的请求顶替）。
+3. **按需使用空余量。** 在不违反前两条和硬上限时，只要本次入口涉及的操作进入后
+   承诺量都不超过各自 `normal_limit`，就必须准入；只有某个涉及操作会超出正常额度
+   时才允许提前返回 `Busy`。不相关操作的承诺量不能单独成为拒绝理由。拒绝不占名额、
+   不留承诺、不产生样本。
+
 ## 离线运行
 
 Python 3.9+，仅标准库。两个演示都使用本仓自制数据和真实回环 HTTP：
