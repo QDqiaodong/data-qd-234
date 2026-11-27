@@ -320,3 +320,297 @@ class Admission:
             else:
                 return False
         return True
+
+
+class _QueuedRequest:
+    """One accepted DeadlineQueue submission, tracked until it settles."""
+
+    __slots__ = ("name", "operation", "duration", "deadline", "seq",
+                 "state", "est_end", "cm")
+
+    def __init__(self, name, operation, duration, deadline, seq):
+        self.name = name
+        self.operation = operation
+        self.duration = duration
+        self.deadline = deadline
+        self.seq = seq
+        self.state = "waiting"
+        self.est_end = None
+        self.cm = None
+
+
+class DeadlineQueue:
+    """In-process scheduling front door over one non-staged Admission gate.
+
+    submit() only accepts work for later dispatch; advance() is the only
+    source of start decisions and never starts the same request twice;
+    finish() is the only confirmation that physical work ended, settling the
+    admission slot and the latency sample on the first call.  Interactive
+    requests carry a deadline and are accepted only while every not yet
+    started interactive commitment stays schedulable (finishing exactly at
+    the deadline counts as on time).  Batch requests have no deadline and
+    start whenever idle capacity cannot break a valid commitment.  Estimated
+    ends from durations and extend() only plan future feasibility; dispatch
+    always follows the actually unfinished running set, so a request whose
+    estimate expired keeps its slot until finish() confirms it.
+    """
+
+    _WINDOW = 64
+    _MAX_WAITING = 12
+    _MAX_WAITING_INTERACTIVE = 6
+
+    def __init__(self, admission, *, slots):
+        if not isinstance(admission, Admission) or admission._staged:
+            raise ValueError("a non-staged Admission instance is required")
+        if type(slots) is not int or slots not in (1, 2):
+            raise ValueError("slots must be 1 or 2")
+        if not 1 <= len(admission._operations) <= 2:
+            raise ValueError("DeadlineQueue supports one or two operations")
+        self._admission = admission
+        self._slots = slots
+        self._limits = {name: state.policy.normal_limit
+                        for name, state in admission._operations.items()}
+        self._requests = {}
+        self._waiting = []          # accepted, not yet started, submission order
+        self._running = {}          # dispatched, not yet confirmed finished
+        self._seq = 0
+        self._tick = 0
+
+    def submit(self, name, operation, now, duration, *, deadline=None):
+        """Accept a request for later dispatch; never starts work itself.
+
+        A request that is not accepted consumes no name, capacity, or sample.
+        """
+        if not isinstance(name, str) or not name:
+            raise ValueError("name must be a nonempty string")
+        if name in self._requests:
+            raise ValueError(f"duplicate request name: {name!r}")
+        if not isinstance(operation, str) or operation not in self._limits:
+            raise ValueError(f"unknown operation: {operation!r}")
+        self._check_now(now)
+        if type(duration) is not int or duration < 1:
+            raise ValueError("duration must be a positive integer")
+        if deadline is not None and type(deadline) is not int:
+            raise ValueError("deadline must be None or an integer tick")
+        self._absorb(now)
+        if len(self._waiting) >= self._MAX_WAITING:
+            return False
+        request = _QueuedRequest(name, operation, duration, deadline, self._seq)
+        if deadline is not None:
+            committed = [req for req in self._waiting if req.deadline is not None]
+            if len(committed) >= self._MAX_WAITING_INTERACTIVE:
+                return False
+            if not self._feasible(now, committed + [request]):
+                return False
+        self._requests[name] = request
+        self._waiting.append(request)
+        self._seq += 1
+        return True
+
+    def advance(self, now):
+        """Start what this tick must and may start; return the started names."""
+        self._check_now(now)
+        self._absorb(now)
+        started = []
+        while True:
+            dispatched = self._start_due_interactive(now, started)
+            dispatched = self._start_safe_batch(now, started) or dispatched
+            if not dispatched:
+                return tuple(started)
+
+    def extend(self, name, new_end, now):
+        """Postpone a running request's estimated end; never dispatches."""
+        self._check_now(now)
+        request = self._requests.get(name)
+        if request is None:
+            raise ValueError(f"unknown request: {name!r}")
+        if request.state != "running":
+            raise ValueError(f"only a running request can be extended: {name!r}")
+        if (type(new_end) is not int or new_end <= request.est_end
+                or new_end < now):
+            raise ValueError("new_end must move the estimated end further out")
+        self._absorb(now)
+        request.est_end = new_end
+        self._reevaluate(now)
+
+    def finish(self, name, now):
+        """Confirm physical completion; only the first confirmation settles."""
+        self._check_now(now)
+        request = self._requests.get(name)
+        if request is None:
+            raise ValueError(f"unknown request: {name!r}")
+        if request.state in ("waiting", "missed"):
+            raise ValueError(f"request is not running: {name!r}")
+        self._absorb(now)
+        if request.state != "running":
+            return False
+        context = request.cm
+        request.cm = None
+        context.__exit__(None, None, None)
+        del self._running[name]
+        request.state = ("late"
+                         if request.deadline is not None and now > request.deadline
+                         else "done")
+        return True
+
+    def status(self, name):
+        """One of waiting, running, missed, done, late."""
+        request = self._requests.get(name)
+        if request is None:
+            raise ValueError(f"unknown request: {name!r}")
+        return request.state
+
+    def _check_now(self, now):
+        if type(now) is not int or now < 0:
+            raise ValueError("now must be a nonnegative integer tick")
+        if now < self._tick:
+            raise ValueError("ticks must be monotonically nondecreasing")
+
+    def _absorb(self, now):
+        if now > self._tick:
+            self._tick = now
+            self._reevaluate(now)
+
+    def _reevaluate(self, now):
+        """Drop waiting commitments that can no longer be honored.
+
+        Older promises win by deadline, then submission order; a request that
+        is individually impossible never blocks deliverable ones.
+        """
+        committed = sorted(
+            (req for req in self._waiting if req.deadline is not None),
+            key=lambda req: (req.deadline, req.seq))
+        kept = []
+        for request in committed:
+            if self._feasible(now, kept + [request]):
+                kept.append(request)
+            else:
+                request.state = "missed"
+        if len(kept) != len(committed):
+            self._waiting = [req for req in self._waiting if req.state == "waiting"]
+
+    def _start_due_interactive(self, now, started):
+        """Start interactive work that may not survive idling another tick.
+
+        Idling is allowed while every commitment can still be honored with
+        all starts pushed to the next tick; otherwise the earliest candidate
+        by (deadline, submission order) with a complete feasible continuation
+        starts now, until idling is safe again or capacity runs out.
+        """
+        dispatched = False
+        while True:
+            committed = self._committed()
+            if not committed:
+                return dispatched
+            releases = {req.name: now + 1 for req in committed}
+            if self._feasible(now, committed, releases=releases):
+                return dispatched
+            for request in sorted(committed,
+                                  key=lambda req: (req.deadline, req.seq)):
+                if not self._has_capacity(request):
+                    continue
+                rest = [other for other in committed if other is not request]
+                extra = ((request.operation, now + request.duration),)
+                if self._feasible(now, rest, extra_running=extra):
+                    self._dispatch(request, now)
+                    started.append(request.name)
+                    dispatched = True
+                    break
+            else:
+                return dispatched
+
+    def _start_safe_batch(self, now, started):
+        """Start waiting batch requests, oldest first, while commitments hold."""
+        dispatched = False
+        for request in list(self._waiting):
+            if request.deadline is not None or request.state != "waiting":
+                continue
+            if not self._has_capacity(request):
+                continue
+            extra = ((request.operation, now + request.duration),)
+            if self._feasible(now, self._committed(), extra_running=extra):
+                self._dispatch(request, now)
+                started.append(request.name)
+                dispatched = True
+        return dispatched
+
+    def _committed(self):
+        return [req for req in self._waiting if req.deadline is not None]
+
+    def _has_capacity(self, request):
+        if len(self._running) >= self._slots:
+            return False
+        active = sum(1 for other in self._running.values()
+                     if other.operation == request.operation)
+        return active < self._limits[request.operation]
+
+    def _dispatch(self, request, now):
+        context = self._admission.work(request.operation)
+        context.__enter__()
+        request.cm = context
+        request.state = "running"
+        request.est_end = now + request.duration
+        self._running[request.name] = request
+        self._waiting.remove(request)
+
+    def _feasible(self, now, jobs, extra_running=(), releases=None):
+        """True if every job can still finish by its deadline.
+
+        Running requests occupy their slots until their estimated end;
+        ``extra_running`` models a tentative start the same way.  Planning
+        looks at most _WINDOW ticks ahead, which covers every commitment by
+        contract.
+        """
+        limit = now + self._WINDOW
+        total = [0] * self._WINDOW
+        per_op = {operation: [0] * self._WINDOW for operation in self._limits}
+        occupants = [(req.operation, req.est_end) for req in self._running.values()]
+        occupants.extend(extra_running)
+        for operation, end in occupants:
+            end = min(max(end, now), limit)
+            for tick in range(now, end):
+                total[tick - now] += 1
+                per_op[operation][tick - now] += 1
+        planned = []
+        for request in jobs:
+            earliest = now if releases is None else releases.get(request.name, now)
+            planned.append((min(request.deadline, limit), request.seq,
+                            request.operation, request.duration, earliest))
+        planned.sort()
+        slots = self._slots
+        limits = self._limits
+        operations = tuple(per_op)
+        memo = set()
+
+        def visit(index):
+            if index == len(planned):
+                return True
+            deadline, _, operation, duration, earliest = planned[index]
+            signature = (index, tuple(total)) + tuple(
+                tuple(per_op[name]) for name in operations)
+            if signature in memo:
+                return False
+            per = per_op[operation]
+            cap = limits[operation]
+            latest = deadline - duration
+            tick = max(now, earliest)
+            while tick <= latest:
+                base = tick - now
+                offset = 0
+                while (offset < duration and total[base + offset] < slots
+                       and per[base + offset] < cap):
+                    offset += 1
+                if offset == duration:
+                    for step in range(duration):
+                        total[base + step] += 1
+                        per[base + step] += 1
+                    if visit(index + 1):
+                        return True
+                    for step in range(duration):
+                        total[base + step] -= 1
+                        per[base + step] -= 1
+                tick += 1
+            memo.add(signature)
+            return False
+
+        return visit(0)
