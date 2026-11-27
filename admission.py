@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from threading import Lock, get_ident
 from time import monotonic_ns
 
+from metrics import valid_evidence
+
 
 @dataclass(frozen=True)
 class Policy:
@@ -149,8 +151,15 @@ class Admission:
                 decisions[name] = Decision(samples, slow, state.limit, applied)
             return decisions
 
+    def work(self, operation, *, evidence=None):
+        """Validate evidence eagerly and return an admission context manager."""
+        if not valid_evidence(evidence):
+            raise ValueError(
+                "evidence must be None or bytes with length from 1 to 4096")
+        return self._work_context(operation, evidence)
+
     @contextmanager
-    def work(self, operation):
+    def _work_context(self, operation, evidence):
         """Try admitting work immediately, and observe its duration on exit."""
         if not self._staged:
             with self._lock:
@@ -158,7 +167,7 @@ class Admission:
                 if state.active >= state.limit:
                     raise Busy(operation)
                 state.active += 1
-            with self._run(operation):
+            with self._run(operation, evidence):
                 yield
             return
         with self._lock:
@@ -171,11 +180,11 @@ class Admission:
             if not self._immediate_path_survives(operation, state):
                 raise Busy(operation)
             state.active += 1
-        with self._run(operation):
+        with self._run(operation, evidence):
             yield
 
     @contextmanager
-    def _run(self, operation):
+    def _run(self, operation, evidence=None):
         state = self._operations[operation]
         elapsed = None
         try:
@@ -189,7 +198,11 @@ class Admission:
                 try:
                     # Completion and slot release are one boundary for refresh/admission.
                     if elapsed is not None:
-                        self._registry.observe(operation, elapsed)
+                        if evidence is None:
+                            self._registry.observe(operation, elapsed)
+                        else:
+                            self._registry.observe(
+                                operation, elapsed, evidence=evidence)
                 finally:
                     state.active -= 1
 

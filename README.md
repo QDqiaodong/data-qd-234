@@ -6,6 +6,103 @@
 `le_counts[i]` 包含恰好等于 `bounds_us[i]` 的样本；`count` 包含超过最大桶界的
 样本，`sum_us` 是累计微秒。未知操作拒绝，不隐式扩张标签。
 
+## 诊断留样与值班读取
+
+累计直方图仍不保存单个请求。需要现场片段时，可显式开启最多 64 个共享槽的诊断
+留样；不传三个 exemplar 参数时行为和旧版本完全一致。片段必须是 `None` 或长度
+1–4096 的 `bytes`，由应用脱敏后提交。采集器只保存操作名、延时和槽位元数据，
+片段字节只通过应用提供的进程内 `exemplar_store.put(slot, evidence)` /
+`get(slot)` 存取，不另藏副本、不落盘。
+
+```python
+from metrics import Histograms
+
+
+class ListSlotStore:
+    def __init__(self, capacity):
+        self._slots = [None] * capacity
+
+    def put(self, slot, evidence):
+        self._slots[slot] = evidence       # 允许原位覆盖
+
+    def get(self, slot):
+        return self._slots[slot]
+
+
+store = ListSlotStore(4)
+registry = Histograms(
+    ["checkout", "lookup"], [50, 100],
+    exemplar_rules={
+        # threshold_us 与桶界无关；只有 duration_us > threshold_us 才留样。
+        "checkout": (200, 2),
+        "lookup": (100, 1),
+    },
+    exemplar_capacity=4,                  # 所有 reserve 之和不能超过 4
+    exemplar_store=store,
+)
+
+registry.observe("checkout", 200, evidence=b"equal-threshold-is-not-kept")
+registry.observe("checkout", 201, evidence=b'{"request":"redacted"}')
+
+reader = registry.open_exemplars()        # 未开启时抛 RuntimeError
+try:
+    for operation, duration_us, evidence in reader:
+        print(operation, duration_us, evidence)
+finally:
+    reader.close()
+```
+
+`exemplar_rules` 必须是 1–32 个**已注册**操作到 `(threshold_us, reserve)` 的
+映射；阈值和容量必须是整数（不接受 `bool`），阈值非负，`reserve >= 1`，保底总和
+不超过容量。只提供部分 exemplar 配置、容量越界、保底超额或 store 缺少可调用的
+`put/get` 都抛 `ValueError`。
+
+`open_exemplars()` 只形成打开瞬间仍在槽中的有限视图，并按留样当时的先后排列；
+打开时不调用 `get`，第一次/每次 `next(reader)` 才从真实槽位读取一条
+`(operation, duration_us, evidence)`。打开后新留的样本不进入旧 reader，新
+reader 才能看到当前槽位。读尽、关闭后再推进都会结束迭代；`close()` 可重复调用，
+也可用 `with registry.open_exemplars() as reader:`。最多同时有 4 个仍有待读片段
+的 reader；空视图不占额度，读尽或关闭后立即归还额度。
+
+每个打开的 reader 独立保护自己尚未读到的槽位：只要任一 reader 还没读到该条，
+该槽就不能覆盖。一次 `next()` 成功从 store 读回字节后，只释放当前 reader 对这
+一条的保护；`close()` 释放它剩余的全部保护。因此值班员读完一条后，即使没有读尽
+整个视图，这条槽也可能立刻重新参与留样。`store.get()` 在采集器锁外调用，缓慢
+读取不会阻塞工作完成、`snapshot()`、`GET /metrics` 或增量导出；两次 `next()`
+之间也不持有采集器锁。
+
+### 写满时的固定策略
+
+有空槽时，符合“有规则、有片段、延时严格大于阈值”的完成一定留样。槽满后：
+
+- 本次操作当前数量低于自己的 `reserve`：只从当前数量**超过自身 reserve** 的其他
+  操作借槽；在这些 donor 操作所有无读取保护的样本中覆盖留样最早的一条。donor
+  的当前数量大于 reserve，所以借走一条后仍满足保底数量；没有无保护合格槽就不留
+  本次。
+- 本次操作已达到 reserve：不能占用其他操作的槽。本实现选择“覆盖自己最早的可覆盖
+  样本”策略：跳过仍被 reader 保护的样本，覆盖本操作最早的无保护样本；如果本操作
+  所有样本都仍有待读 reader，则放弃本次新现场。
+
+选择后一种策略意味着压满时，值班员在新视图中会看不到那个“最早的可覆盖同操作旧
+现场”，但能看到最新现场；若自己的整组样本都被暂停的 reader 保护，则会看不到
+“本次最新现场”，而旧 reader 仍会完整走完打开时的 A/B 等内容。跨操作借还不会抢走
+其他操作满足当前保底数量所需的槽位。放弃留样不影响正式直方图：合法完成仍恰好记
+一次累计样本，`GET /metrics`、refresh、SLO 窗口和增量出口都继续使用原计数，且
+输出中没有 evidence。
+
+### 从 Admission.work 提交片段
+
+普通 `gate.work(operation, evidence=...)` 接受同样的可选片段。非法片段在取得准入
+名额前抛 `ValueError`；`Busy`、未进入的工作不记数也不写槽。已进入的工作无论正常
+返回还是正文抛错，都在退出时把片段交给 `observe`，异常继续原样传播。两段式准入
+下的普通 `work()` 行为相同；`flow()` 和 `ticket.work()` 不增加 evidence 参数，
+首段/续段的原有计量行为不变。
+
+```python
+with gate.work("checkout", evidence=redacted_bytes):
+    result = checkout(cart)
+```
+
 ## SLO 窗口裁决与限额复核
 
 `slo.py` 的 `evaluate_window(...)` 接收 1–32 个进程的 `(before, after)` 累计快照，
@@ -226,6 +323,9 @@ healthy window: 0/2; parse limit=2; parse HTTP 200; scrape parse count=6
 ```
 
 `test_slo.py` 提供 SLO 区间、批量复核、通知和整轮校验的确定性测试；
+`test_exemplars.py` 覆盖配置校验、同操作写满冲突、跨操作借还、四个 reader 额度、
+暂停 `get()` 时采集不阻塞、普通/两段式 `Admission.work(..., evidence=...)`，以及
+容量被读保护压满时的真实 `/metrics` 回环和增量导出；
 `test_delta_export.py` 覆盖增量桶、丢回复、封边换接、连续序号和真实
 `Admission` 两阶段完成时点；`test_metrics.py` 仍包含 GET /metrics 的真实本机
 HTTP 回环测试。
