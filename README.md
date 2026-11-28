@@ -299,6 +299,98 @@ print(meter.totals("new"))         # {'checkout': {'count': 1, 'sum_us': 300}}
 
 换接采用封边路径：若旧端结果不明，下一次推进对旧 `(stream_id, seq)` 调 `fence`。得到 `"applied"` 表示旧端已入账，该批留在旧端；得到 `"sealed"` 表示旧端保证永远不能再计入，随后才把**同一 `seq`、同一不可变 delta** 发给新端。`fence` 超时同样不提供证据，只会原样重试幂等 `fence`，不会猜测性地发新端。序号只属于非空批，换端和重送都不重置或另开序号。发送回调里可以运行业务代码并记录新样本；delta 在回调前已固定，这些新完成量只会进入下一批。`test_delta_export.py` 用真实 `Admission`/`Histograms`、可控时钟和可注入丢回复的进程内计量器覆盖了这一验收场景。
 
+## 异构执行器在线换代：操作准入之外再选机器
+
+`Admission.work` 只做操作级准入，一个操作名并不等于有一台能执行它的机器。
+`worker_rollout.py` 的 `WorkerRollout` 包在同一个真实、非分段的 `Admission` 之外：
+档位裁决与完成记账仍完全走原准入器和原 registry，本层只负责把一项获准工作绑定到
+一台**就绪、空闲且兼容**的执行器，并在运维逐步换代时守住实体上限、设备独占与
+保障名额。不增加真实设备、后台调度或外部服务，`start`/`stop` 只是进程内假设备
+回调，不回入控制器。
+
+```python
+from admission import Admission, Busy, Policy
+from metrics import Histograms
+from worker_rollout import WorkerRollout
+
+specs = {
+    # 执行器名: (设备名, 支持的非空操作集合)
+    "O": ("dA", {"A"}),          # 旧执行器，独占设备 dA
+    "N": ("dA", {"A"}),          # 新一代，与 O 同设备、不能同时装载
+    "F": ("dF", {"A", "B"}),     # 一台能做两种工作，但一次只做一种
+    "L": ("dB", {"B"}),
+    "T": ("dT", {"A"}),          # 不同设备的可选临时执行器
+}
+registry = Histograms(["A", "B"], [50, 100])
+policy = Policy(normal_limit=8, protected_limit=1, budget_us=50,
+                min_samples=2, max_slow_percent=50)
+gate = Admission(registry, {"A": policy, "B": policy})
+
+mounted = set()
+
+def start(name):                 # 返回真才真正装载；返回假表示可重试
+    mounted.add(name)
+    return True
+
+def stop(name):                  # 只会成功卸载一台已无在途工作的执行器
+    mounted.discard(name)
+
+rollout = WorkerRollout(
+    gate, specs, {"O", "F", "L"},          # initial：已装载且就绪，不重复启动
+    capacity=4,                            # 同时装载的执行器数上限
+    floor={"A": 1, "B": 1},                # 各操作的并行保障名额
+    start=start, stop=stop)
+
+# 应用接件：拿到的是实际执行器名，直到 with 退出都保持绑定。
+with rollout.work("A") as worker:
+    print("A 在", worker, "上执行")        # 例如 F
+
+# 运维提交换代：把同设备的 O 换成 N，必要时用 T 做一次性临时跳板。
+assert rollout.request({"N", "F", "L"}, bridge={"T"})
+while rollout.step() != "done":
+    print(rollout.status())                # ready / draining / offline
+# T 至多装载、卸载各一次，结束后真正离线；O 已被 N 替换。
+```
+
+### 保障名额是“同时可分配”，不是逐操作分别数
+
+`floor` 给的是每个策略操作在现有工作都完成后还能并行处理多少的承诺。所有名额必须
+能**同时**分给**不同的就绪执行器**，且各执行器支持分到的操作；正在处理工作的就绪
+执行器仍算这份结构容量，排空中或未装载的不算。例如只有一台同时支持 A/B 的 `F` 时，
+`floor={"A":1,"B":1}` 无法满足——它一次只能做一种工作，接不了两份保障。这种布局若
+没有先真正就绪一台支持 A 的临时执行器，`O` 就不允许开始排空；连一条安全路径都不存在
+时 `request()` 直接返回假，且不调用任何设备回调。
+
+### 换代动作与返回值
+
+`request(target, *, bridge=())` 只提交最终就绪集合和可选临时执行器（临时执行器不得
+出现在当前或目标集合里），不改变路由、不调设备回调；它会离线搜索一条从当前集合到
+目标的完整安全路径，非最终执行器也能参与。`step()` 由单线程运维调用，每次最多完成
+一个可观察动作，返回：
+
+- `progress`：标一台就绪执行器为排空中、卸载一台已排空且无在途工作的执行器，或成功
+  装载一台执行器。标排空立即停止新接件，但不中断已绑定的工作，也不被在途工作阻止。
+- `waiting`：推进只能等已有工作退出，不阻塞；工作退出后继续 `step()` 必能抵达目标。
+- `retry`：`start(name)` 返回假。执行器未装载、可重试，本次不改变任何集合或接件资格，
+  也不算入保障容量；下一次启动恢复后继续推进。
+- `done`：已到目标且无需再做动作。换代未结束又提交会抛 `RuntimeError`，不替换原目标；
+  与当前集合相同的目标是合法的无动作请求。
+
+每个动作前后都守住实体上限、设备独占（同设备最多一台，排空中未 `stop` 的仍占设备和
+实体容量）和就绪集合的保障名额，并为剩余换代保留一条安全后续，因此不会进入只能靠
+恢复已退出旧执行器才能解开的死路。
+
+### 应用接件与原准入口径
+
+`with rollout.work(operation) as worker:` 先选一台就绪、空闲且兼容的执行器并占位，再
+进入真实 `Admission.work`：满足当前档位限制且有兼容空闲执行器时必须准入，多个可用时
+不限定选择；否则立即抛原 `Busy`，不执行正文、不遗留占用、不记完成。未知操作沿用原
+`KeyError`。正文正常或异常离开都归还执行器占用，并让原 registry 按原准入口径只记一次
+实际完成；正文异常不会被吞掉。作用域可在同线程交叠，设备回调和推进锁都不会留在用户
+正文里。`test_worker_rollout.py` 用进程内假设备、可控时钟和原 `Histograms.snapshot()`
+核对实际落点、设备回调、完成数/延时与忙拒绝，以及一次慢完成后 `refresh()` 在实体仍有
+空位时拒绝超过保护额度的工作。
+
 ## 离线运行
 
 Python 3.9+，仅标准库。两个演示都使用本仓自制数据和真实回环 HTTP：
